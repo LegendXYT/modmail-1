@@ -1,36 +1,58 @@
 import asyncio
 import inspect
 import os
-import traceback
 import random
+import re
+from sys import stdout
+import traceback
 from contextlib import redirect_stdout
 from datetime import datetime
 from difflib import get_close_matches
-from io import StringIO, BytesIO
-from itertools import zip_longest, takewhile
+from io import BytesIO, StringIO
+from itertools import takewhile, zip_longest
 from json import JSONDecodeError, loads
+from subprocess import PIPE
 from textwrap import indent
 from types import SimpleNamespace
 from typing import Union
 
 import discord
+from aiohttp import ClientResponseError
 from discord.enums import ActivityType, Status
 from discord.ext import commands, tasks
-from discord.utils import escape_markdown, escape_mentions
-
-from aiohttp import ClientResponseError
+from discord.ext.commands.view import StringView
 from pkg_resources import parse_version
 
-from core import checks
+from core import checks, utils
 from core.changelog import Changelog
-from core.models import InvalidConfigError, PermissionLevel, getLogger
+from core.models import (
+    HostingMethod,
+    InvalidConfigError,
+    PermissionLevel,
+    UnseenFormatter,
+    getLogger,
+)
+from core.utils import trigger_typing, truncate
 from core.paginator import EmbedPaginatorSession, MessagePaginatorSession
-from core import utils
+
 
 logger = getLogger(__name__)
 
 
 class ModmailHelpCommand(commands.HelpCommand):
+    async def command_callback(self, ctx, *, command=None):
+        """Ovrwrites original command_callback to ensure `help` without any arguments
+        returns with checks, `help all` returns without checks"""
+        if command is None:
+            self.verify_checks = True
+        else:
+            self.verify_checks = False
+
+        if command == "all":
+            command = None
+
+        return await super().command_callback(ctx, command=command)
+
     async def format_cog_help(self, cog, *, no_cog=False):
         bot = self.context.bot
         prefix = self.clean_prefix
@@ -47,7 +69,7 @@ class ModmailHelpCommand(commands.HelpCommand):
             else:
                 format_ = f"`[{perm_level}] {prefix + cmd.qualified_name}` "
 
-            format_ += f"- {cmd.short_doc}\n"
+            format_ += f"- {cmd.short_doc}\n" if cmd.short_doc else "- *No description.*\n"
             if not format_.strip():
                 continue
             if len(format_) + len(formats[-1]) >= 1024:
@@ -64,14 +86,13 @@ class ModmailHelpCommand(commands.HelpCommand):
             )
             embed = discord.Embed(description=f"*{description}*", color=bot.main_color)
 
+            if not format_:
+                continue
+
             embed.add_field(name="Commands", value=format_ or "No commands.")
 
             continued = " (Continued)" if embeds else ""
-            name = (
-                cog.qualified_name + " - Help"
-                if not no_cog
-                else "Miscellaneous Commands"
-            )
+            name = cog.qualified_name + " - Help" if not no_cog else "Miscellaneous Commands"
             embed.set_author(name=name + continued, icon_url=bot.user.avatar_url)
 
             embed.set_footer(
@@ -92,11 +113,7 @@ class ModmailHelpCommand(commands.HelpCommand):
         bot = self.context.bot
 
         # always come first
-        default_cogs = [
-            bot.get_cog("Modmail"),
-            bot.get_cog("Utility"),
-            bot.get_cog("Plugins"),
-        ]
+        default_cogs = [bot.get_cog("Modmail"), bot.get_cog("Utility"), bot.get_cog("Plugins")]
 
         default_cogs.extend(c for c in cogs if c not in default_cogs)
 
@@ -105,16 +122,12 @@ class ModmailHelpCommand(commands.HelpCommand):
         if no_cog_commands:
             embeds.extend(await self.format_cog_help(no_cog_commands, no_cog=True))
 
-        session = EmbedPaginatorSession(
-            self.context, *embeds, destination=self.get_destination()
-        )
+        session = EmbedPaginatorSession(self.context, *embeds, destination=self.get_destination())
         return await session.run()
 
     async def send_cog_help(self, cog):
         embeds = await self.format_cog_help(cog)
-        session = EmbedPaginatorSession(
-            self.context, *embeds, destination=self.get_destination()
-        )
+        session = EmbedPaginatorSession(self.context, *embeds, destination=self.get_destination())
         return await session.run()
 
     async def _get_help_embed(self, topic):
@@ -172,35 +185,48 @@ class ModmailHelpCommand(commands.HelpCommand):
         command = self.context.kwargs.get("command")
         val = self.context.bot.snippets.get(command)
         if val is not None:
-            return await self.get_destination().send(
-                escape_mentions(f"**`{command}` is a snippet, " f"content:**\n\n{val}")
+            embed = discord.Embed(
+                title=f"{command} is a snippet.", color=self.context.bot.main_color
             )
+            embed.add_field(name=f"`{command}` will send:", value=val)
+            return await self.get_destination().send(embed=embed)
 
         val = self.context.bot.aliases.get(command)
         if val is not None:
             values = utils.parse_alias(val)
 
-            if len(values) == 1:
+            if not values:
                 embed = discord.Embed(
-                    title=f"{command} is an alias.",
-                    color=self.context.bot.main_color,
-                    description=f"`{command}` points to `{escape_markdown(values[0])}`.",
+                    title="Error",
+                    color=self.context.bot.error_color,
+                    description=f"Alias `{command}` is invalid, this alias will now be deleted."
+                    "This alias will now be deleted.",
                 )
+                embed.add_field(name=f"{command}` used to be:", value=val)
+                self.context.bot.aliases.pop(command)
+                await self.context.bot.config.update()
             else:
-                embed = discord.Embed(
-                    title=f"{command} is an alias.",
-                    color=self.context.bot.main_color,
-                    description=f"**`{command}` points to the following steps:**",
-                )
-                for i, val in enumerate(values, start=1):
-                    embed.description += f"\n{i}: {escape_markdown(val)}"
+                if len(values) == 1:
+                    embed = discord.Embed(
+                        title=f"{command} is an alias.", color=self.context.bot.main_color
+                    )
+                    embed.add_field(name=f"`{command}` points to:", value=values[0])
+                else:
+                    embed = discord.Embed(
+                        title=f"{command} is an alias.",
+                        color=self.context.bot.main_color,
+                        description=f"**`{command}` points to the following steps:**",
+                    )
+                    for i, val in enumerate(values, start=1):
+                        embed.add_field(name=f"Step {i}:", value=val)
+
             embed.set_footer(
-                text=f'Type "{self.clean_prefix}{self.command_attrs["name"]} alias" for more '
-                "details on aliases."
+                text=f'Type "{self.clean_prefix}{self.command_attrs["name"]} alias" '
+                "for more details on aliases."
             )
             return await self.get_destination().send(embed=embed)
 
-        logger.warning("CommandNotFound: %s", str(error))
+        logger.warning("CommandNotFound: %s", error)
 
         embed = discord.Embed(color=self.context.bot.error_color)
         embed.set_footer(text=f'Command/Category "{command}" not found.')
@@ -213,9 +239,7 @@ class ModmailHelpCommand(commands.HelpCommand):
 
         closest = get_close_matches(command, choices)
         if closest:
-            embed.add_field(
-                name=f"Perhaps you meant:", value="\n".join(f"`{x}`" for x in closest)
-            )
+            embed.add_field(name="Perhaps you meant:", value="\n".join(f"`{x}`" for x in closest))
         else:
             embed.title = "Cannot find command or category"
             embed.set_footer(
@@ -232,14 +256,16 @@ class Utility(commands.Cog):
         self.bot = bot
         self._original_help_command = bot.help_command
         self.bot.help_command = ModmailHelpCommand(
-            verify_checks=False,
             command_attrs={
                 "help": "Shows this help message.",
                 "checks": [checks.has_permissions_predicate(PermissionLevel.REGULAR)],
             },
         )
         self.bot.help_command.cog = self
-        self.loop_presence.start()
+        self.loop_presence.start()  # pylint: disable=no-member
+        if not self.bot.config.get("enable_eval"):
+            self.eval_.enabled = False
+            logger.info("Eval disabled. enable_eval=False")
 
     def cog_unload(self):
         self.bot.help_command = self._original_help_command
@@ -250,7 +276,7 @@ class Utility(commands.Cog):
     async def changelog(self, ctx, version: str.lower = ""):
         """Shows the changelog of the Modmail."""
         changelog = await Changelog.from_url(self.bot)
-        version = version.lstrip("vV") if version else changelog.latest_version.version
+        version = version.lstrip("v") if version else changelog.latest_version.version
 
         try:
             index = [v.version for v in changelog.versions].index(version)
@@ -277,7 +303,7 @@ class Utility(commands.Cog):
                     f"View the changelog here: {changelog.latest_version.changelog_url}#v{version[::2]}"
                 )
 
-    @commands.command(aliases=["bot", "info"])
+    @commands.command(aliases=["info"])
     @checks.has_permissions(PermissionLevel.REGULAR)
     @utils.trigger_typing
     async def about(self, ctx):
@@ -299,18 +325,18 @@ class Utility(commands.Cog):
         embed.add_field(name="Latency", value=f"{self.bot.latency * 1000:.2f} ms")
         embed.add_field(name="Version", value=f"`{self.bot.version}`")
         embed.add_field(name="Authors", value="`kyb3r`, `Taki`, `fourjr`")
+        embed.add_field(name="Hosting Method", value=self.bot.hosting_method.name)
 
         changelog = await Changelog.from_url(self.bot)
         latest = changelog.latest_version
 
         if self.bot.version.is_prerelease:
             stable = next(
-                filter(
-                    lambda v: not parse_version(v.version).is_prerelease,
-                    changelog.versions,
-                )
+                filter(lambda v: not parse_version(v.version).is_prerelease, changelog.versions)
             )
-            footer = f"You are on the prerelease version • the latest version is v{stable.version}."
+            footer = (
+                f"You are on the prerelease version • the latest version is v{stable.version}."
+            )
         elif self.bot.version < parse_version(latest.version):
             footer = f"A newer version is available v{latest.version}."
         else:
@@ -319,7 +345,7 @@ class Utility(commands.Cog):
         embed.add_field(
             name="Want Modmail in Your Server?",
             value="Follow the installation guide on [GitHub](https://github.com/kyb3r/modmail/) "
-            "and join our [Discord server](https://discord.gg/F34cRU8/)!",
+            "and join our [Discord server](https://discord.gg/F34cRU8)!",
             inline=False,
         )
 
@@ -359,14 +385,13 @@ class Utility(commands.Cog):
     @checks.has_permissions(PermissionLevel.OWNER)
     @utils.trigger_typing
     async def debug(self, ctx):
-        """Shows the recent application-logs of the bot."""
+        """Shows the recent application logs of the bot."""
 
         log_file_name = self.bot.token.split(".")[0]
 
         with open(
             os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                f"../temp/{log_file_name}.log",
+                os.path.dirname(os.path.abspath(__file__)), f"../temp/{log_file_name}.log"
             ),
             "r+",
         ) as f:
@@ -383,23 +408,23 @@ class Utility(commands.Cog):
 
         messages = []
 
-        # Using Scala formatting because it's similar to Python for exceptions
+        # Using Haskell formatting because it's similar to Python for exceptions
         # and it does a fine job formatting the logs.
-        msg = "```Scala\n"
+        msg = "```Haskell\n"
 
         for line in logs.splitlines(keepends=True):
-            if msg != "```Scala\n":
+            if msg != "```Haskell\n":
                 if len(line) + len(msg) + 3 > 2000:
                     msg += "```"
                     messages.append(msg)
-                    msg = "```Scala\n"
+                    msg = "```Haskell\n"
             msg += line
             if len(msg) + 3 > 2000:
                 msg = msg[:1993] + "[...]```"
                 messages.append(msg)
-                msg = "```Scala\n"
+                msg = "```Haskell\n"
 
-        if msg != "```Scala\n":
+        if msg != "```Haskell\n":
             msg += "```"
             messages.append(msg)
 
@@ -416,22 +441,19 @@ class Utility(commands.Cog):
     async def debug_hastebin(self, ctx):
         """Posts application-logs to Hastebin."""
 
-        haste_url = os.environ.get("HASTE_URL", "https://hasteb.in")
+        haste_url = os.environ.get("HASTE_URL", "https://hastebin.cc")
         log_file_name = self.bot.token.split(".")[0]
 
         with open(
             os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                f"../temp/{log_file_name}.log",
+                os.path.dirname(os.path.abspath(__file__)), f"../temp/{log_file_name}.log"
             ),
             "rb+",
         ) as f:
             logs = BytesIO(f.read().strip())
 
         try:
-            async with self.bot.session.post(
-                haste_url + "/documents", data=logs
-            ) as resp:
+            async with self.bot.session.post(haste_url + "/documents", data=logs) as resp:
                 data = await resp.json()
                 try:
                     key = data["key"]
@@ -447,8 +469,7 @@ class Utility(commands.Cog):
             embed = discord.Embed(
                 title="Debug Logs",
                 color=self.bot.main_color,
-                description="Something's wrong. "
-                "We're unable to upload your logs to hastebin.",
+                description="Something's wrong. We're unable to upload your logs to hastebin.",
             )
             embed.set_footer(text="Go to Heroku to see your logs.")
         await ctx.send(embed=embed)
@@ -463,8 +484,7 @@ class Utility(commands.Cog):
 
         with open(
             os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                f"../temp/{log_file_name}.log",
+                os.path.dirname(os.path.abspath(__file__)), f"../temp/{log_file_name}.log"
             ),
             "w",
         ):
@@ -527,9 +547,7 @@ class Utility(commands.Cog):
         else:
             msg += f"{activity.name}."
 
-        embed = discord.Embed(
-            title="Activity Changed", description=msg, color=self.bot.main_color
-        )
+        embed = discord.Embed(title="Activity Changed", description=msg, color=self.bot.main_color)
         return await ctx.send(embed=embed)
 
     @commands.command()
@@ -566,14 +584,10 @@ class Utility(commands.Cog):
         await self.bot.config.update()
 
         msg = f"Status set to: {status.value}."
-        embed = discord.Embed(
-            title="Status Changed", description=msg, color=self.bot.main_color
-        )
+        embed = discord.Embed(title="Status Changed", description=msg, color=self.bot.main_color)
         return await ctx.send(embed=embed)
 
-    async def set_presence(
-        self, *, status=None, activity_type=None, activity_message=None
-    ):
+    async def set_presence(self, *, status=None, activity_type=None, activity_message=None):
 
         if status is None:
             status = self.bot.config.get("status")
@@ -582,9 +596,7 @@ class Utility(commands.Cog):
             activity_type = self.bot.config.get("activity_type")
 
         url = None
-        activity_message = (
-            activity_message or self.bot.config["activity_message"]
-        ).strip()
+        activity_message = (activity_message or self.bot.config["activity_message"]).strip()
         if activity_type is not None and not activity_message:
             logger.warning(
                 'No activity message found whilst activity is provided, defaults to "Modmail".'
@@ -600,9 +612,7 @@ class Utility(commands.Cog):
             url = self.bot.config["twitch_url"]
 
         if activity_type is not None:
-            activity = discord.Activity(
-                type=activity_type, name=activity_message, url=url
-            )
+            activity = discord.Activity(type=activity_type, name=activity_message, url=url)
         else:
             activity = None
         await self.bot.change_presence(activity=activity, status=status)
@@ -653,7 +663,7 @@ class Utility(commands.Cog):
 
     @commands.command()
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def mention(self, ctx, *, mention: str = None):
+    async def mention(self, ctx, *mention: Union[discord.Role, discord.Member]):
         """
         Change what the bot mentions at the start of each thread.
 
@@ -662,13 +672,12 @@ class Utility(commands.Cog):
         # TODO: ability to disable mention.
         current = self.bot.config["mention"]
 
-        if mention is None:
+        if not mention:
             embed = discord.Embed(
-                title="Current mention:",
-                color=self.bot.main_color,
-                description=str(current),
+                title="Current mention:", color=self.bot.main_color, description=str(current)
             )
         else:
+            mention = " ".join(i.mention for i in mention)
             embed = discord.Embed(
                 title="Changed mention!",
                 description=f'On thread creation the bot now says "{mention}".',
@@ -761,12 +770,10 @@ class Utility(commands.Cog):
                 embed = exc.embed
         else:
             embed = discord.Embed(
-                title="Error",
-                color=self.bot.error_color,
-                description=f"{key} is an invalid key.",
+                title="Error", color=self.bot.error_color, description=f"{key} is an invalid key."
             )
             valid_keys = [f"`{k}`" for k in sorted(keys)]
-            embed.add_field(name="Valid keys", value=", ".join(valid_keys))
+            embed.add_field(name="Valid keys", value=truncate(", ".join(valid_keys), 1024))
 
         return await ctx.send(embed=embed)
 
@@ -785,9 +792,7 @@ class Utility(commands.Cog):
             )
         else:
             embed = discord.Embed(
-                title="Error",
-                color=self.bot.error_color,
-                description=f"{key} is an invalid key.",
+                title="Error", color=self.bot.error_color, description=f"{key} is an invalid key."
             )
             valid_keys = [f"`{k}`" for k in sorted(keys)]
             embed.add_field(name="Valid keys", value=", ".join(valid_keys))
@@ -808,9 +813,7 @@ class Utility(commands.Cog):
             if key in keys:
                 desc = f"`{key}` is set to `{self.bot.config[key]}`"
                 embed = discord.Embed(color=self.bot.main_color, description=desc)
-                embed.set_author(
-                    name="Config variable", icon_url=self.bot.user.avatar_url
-                )
+                embed.set_author(name="Config variable", icon_url=self.bot.user.avatar_url)
 
             else:
                 embed = discord.Embed(
@@ -825,12 +828,9 @@ class Utility(commands.Cog):
         else:
             embed = discord.Embed(
                 color=self.bot.main_color,
-                description="Here is a list of currently "
-                "set configuration variable(s).",
+                description="Here is a list of currently set configuration variable(s).",
             )
-            embed.set_author(
-                name="Current config(s):", icon_url=self.bot.user.avatar_url
-            )
+            embed.set_author(name="Current config(s):", icon_url=self.bot.user.avatar_url)
             config = self.bot.config.filter_default(self.bot.config)
 
             for name, value in config.items():
@@ -848,11 +848,18 @@ class Utility(commands.Cog):
         if key is not None and not (
             key in self.bot.config.public_keys or key in self.bot.config.protected_keys
         ):
+            closest = get_close_matches(
+                key, {**self.bot.config.public_keys, **self.bot.config.protected_keys}
+            )
             embed = discord.Embed(
                 title="Error",
                 color=self.bot.error_color,
                 description=f"`{key}` is an invalid key.",
             )
+            if closest:
+                embed.add_field(
+                    name=f"Perhaps you meant:", value="\n".join(f"`{x}`" for x in closest)
+                )
             return await ctx.send(embed=embed)
 
         config_help = self.bot.config.config_help
@@ -866,7 +873,7 @@ class Utility(commands.Cog):
             return await ctx.send(embed=embed)
 
         def fmt(val):
-            return val.format(prefix=self.bot.prefix, bot=self.bot)
+            return UnseenFormatter().format(val, prefix=self.bot.prefix, bot=self.bot)
 
         index = 0
         embeds = []
@@ -874,13 +881,10 @@ class Utility(commands.Cog):
             if current_key == key:
                 index = i
             embed = discord.Embed(
-                title=f"Configuration description on {current_key}:",
-                color=self.bot.main_color,
+                title=f"Configuration description on {current_key}:", color=self.bot.main_color
             )
             embed.add_field(name="Default:", value=fmt(info["default"]), inline=False)
-            embed.add_field(
-                name="Information:", value=fmt(info["description"]), inline=False
-            )
+            embed.add_field(name="Information:", value=fmt(info["description"]), inline=False)
             if info["examples"]:
                 example_text = ""
                 for example in info["examples"]:
@@ -888,7 +892,7 @@ class Utility(commands.Cog):
                 embed.add_field(name="Example(s):", value=example_text, inline=False)
 
             note_text = ""
-            for note in info["notes"]:
+            for note in info.get("notes", []):
                 note_text += f"- {fmt(note)}\n"
             if note_text:
                 embed.add_field(name="Note(s):", value=note_text, inline=False)
@@ -929,9 +933,7 @@ class Utility(commands.Cog):
         if name is not None:
             val = self.bot.aliases.get(name)
             if val is None:
-                embed = utils.create_not_found_embed(
-                    name, self.bot.aliases.keys(), "Alias"
-                )
+                embed = utils.create_not_found_embed(name, self.bot.aliases.keys(), "Alias")
                 return await ctx.send(embed=embed)
 
             values = utils.parse_alias(val)
@@ -940,34 +942,37 @@ class Utility(commands.Cog):
                 embed = discord.Embed(
                     title="Error",
                     color=self.bot.error_color,
-                    description=f"Alias `{name}` is invalid, it used to be `{escape_markdown(val)}`. "
-                    f"This alias will now be deleted.",
+                    description=f"Alias `{name}` is invalid, this alias will now be deleted."
+                    "This alias will now be deleted.",
                 )
+                embed.add_field(name=f"{name}` used to be:", value=utils.truncate(val, 1024))
                 self.bot.aliases.pop(name)
                 await self.bot.config.update()
                 return await ctx.send(embed=embed)
 
             if len(values) == 1:
                 embed = discord.Embed(
-                    color=self.bot.main_color,
-                    description=f"`{name}` points to `{escape_markdown(values[0])}`.",
+                    title=f'Alias - "{name}":', description=values[0], color=self.bot.main_color
                 )
-            else:
-                embed = discord.Embed(
-                    color=self.bot.main_color,
-                    description=f"**`{name}` points to the following steps:**",
-                )
-                for i, val in enumerate(values, start=1):
-                    embed.description += f"\n{i}: {escape_markdown(val)}"
+                return await ctx.send(embed=embed)
 
-            return await ctx.send(embed=embed)
+            else:
+                embeds = []
+                for i, val in enumerate(values, start=1):
+                    embed = discord.Embed(
+                        color=self.bot.main_color,
+                        title=f'Alias - "{name}" - Step {i}:',
+                        description=val,
+                    )
+                    embeds += [embed]
+                session = EmbedPaginatorSession(ctx, *embeds)
+                return await session.run()
 
         if not self.bot.aliases:
             embed = discord.Embed(
-                color=self.bot.error_color,
-                description="You dont have any aliases at the moment.",
+                color=self.bot.error_color, description="You dont have any aliases at the moment."
             )
-            embed.set_footer(text=f"Do {self.bot.prefix}help alias for more commands.")
+            embed.set_footer(text=f'Do "{self.bot.prefix}help alias" for more commands.')
             embed.set_author(name="Aliases", icon_url=ctx.guild.icon_url)
             return await ctx.send(embed=embed)
 
@@ -992,7 +997,74 @@ class Utility(commands.Cog):
         if val is None:
             embed = utils.create_not_found_embed(name, self.bot.aliases.keys(), "Alias")
             return await ctx.send(embed=embed)
-        return await ctx.send(escape_markdown(escape_mentions(val)).replace("<", "\\<"))
+
+        val = utils.truncate(utils.escape_code_block(val), 2048 - 7)
+        embed = discord.Embed(
+            title=f'Raw alias - "{name}":', description=f"```\n{val}```", color=self.bot.main_color
+        )
+
+        return await ctx.send(embed=embed)
+
+    async def make_alias(self, name, value, action):
+        values = utils.parse_alias(value)
+        if not values:
+            embed = discord.Embed(
+                title="Error",
+                color=self.bot.error_color,
+                description="Invalid multi-step alias, try wrapping each steps in quotes.",
+            )
+            embed.set_footer(text=f'See "{self.bot.prefix}alias add" for more details.')
+            return embed
+
+        if len(values) > 25:
+            embed = discord.Embed(
+                title="Error", description="Too many steps, max=25.", color=self.bot.error_color
+            )
+            return embed
+
+        save_aliases = []
+
+        multiple_alias = len(values) > 1
+
+        embed = discord.Embed(title=f"{action} alias", color=self.bot.main_color)
+
+        if not multiple_alias:
+            embed.add_field(name=f"`{name}` points to:", value=utils.truncate(values[0], 1024))
+        else:
+            embed.description = f"`{name}` now points to the following steps:"
+
+        for i, val in enumerate(values, start=1):
+            view = StringView(val)
+            linked_command = view.get_word().lower()
+            message = view.read_rest()
+
+            if not self.bot.get_command(linked_command):
+                alias_command = self.bot.aliases.get(linked_command)
+                if alias_command is not None:
+                    save_aliases.extend(utils.normalize_alias(alias_command, message))
+                else:
+                    embed = discord.Embed(title="Error", color=self.bot.error_color)
+
+                    if multiple_alias:
+                        embed.description = (
+                            "The command you are attempting to point "
+                            f"to does not exist: `{linked_command}`."
+                        )
+                    else:
+                        embed.description = (
+                            "The command you are attempting to point "
+                            f"to on step {i} does not exist: `{linked_command}`."
+                        )
+
+                    return embed
+            else:
+                save_aliases.append(val)
+            if multiple_alias:
+                embed.add_field(name=f"Step {i}:", value=utils.truncate(val, 1024))
+
+        self.bot.aliases[name] = " && ".join(f'"{a}"' for a in save_aliases)
+        await self.bot.config.update()
+        return embed
 
     @alias.command(name="add")
     @checks.has_permissions(PermissionLevel.MODERATOR)
@@ -1036,76 +1108,11 @@ class Utility(commands.Cog):
             embed = discord.Embed(
                 title="Error",
                 color=self.bot.error_color,
-                description=f"Alias names cannot be longer than 120 characters.",
+                description="Alias names cannot be longer than 120 characters.",
             )
 
-        if embed is not None:
-            return await ctx.send(embed=embed)
-
-        values = utils.parse_alias(value)
-
-        if not values:
-            embed = discord.Embed(
-                title="Error",
-                color=self.bot.error_color,
-                description="Invalid multi-step alias, try wrapping each steps in quotes.",
-            )
-            embed.set_footer(text=f'See "{self.bot.prefix}alias add" for more details.')
-            return await ctx.send(embed=embed)
-
-        if len(values) == 1:
-            linked_command, *messages = values[0].split(maxsplit=1)
-            if not self.bot.get_command(linked_command):
-                alias_command = self.bot.aliases.get(linked_command)
-                if alias_command is not None:
-                    if messages:
-                        values = [f"{alias_command} {messages[0]}"]
-                    else:
-                        values = [alias_command]
-                else:
-                    embed = discord.Embed(
-                        title="Error",
-                        color=self.bot.error_color,
-                        description="The command you are attempting to point "
-                        f"to does not exist: `{linked_command}`.",
-                    )
-                    return await ctx.send(embed=embed)
-
-            embed = discord.Embed(
-                title="Added alias",
-                color=self.bot.main_color,
-                description=f'`{name}` points to: "{values[0]}".',
-            )
-
-        else:
-            embed = discord.Embed(
-                title="Added alias",
-                color=self.bot.main_color,
-                description=f"`{name}` now points to the following steps:",
-            )
-
-            for i, val in enumerate(values, start=1):
-                linked_command, *messages = val.split(maxsplit=1)
-                if not self.bot.get_command(linked_command):
-                    alias_command = self.bot.aliases.get(linked_command)
-                    if alias_command is not None:
-                        if messages:
-                            values = [f"{alias_command} {messages[0]}"]
-                        else:
-                            values = [alias_command]
-                    else:
-                        embed = discord.Embed(
-                            title="Error",
-                            color=self.bot.error_color,
-                            description="The command you are attempting to point "
-                            f"to n step {i} does not exist: `{linked_command}`.",
-                        )
-                        return await ctx.send(embed=embed)
-                embed.description += f"\n{i}: {val}"
-
-        self.bot.aliases[name] = " && ".join(values)
-        await self.bot.config.update()
-
+        if embed is None:
+            embed = await self.make_alias(name, value, "Added")
         return await ctx.send(embed=embed)
 
     @alias.command(name="remove", aliases=["del", "delete"])
@@ -1137,68 +1144,7 @@ class Utility(commands.Cog):
             embed = utils.create_not_found_embed(name, self.bot.aliases.keys(), "Alias")
             return await ctx.send(embed=embed)
 
-        values = utils.parse_alias(value)
-
-        if not values:
-            embed = discord.Embed(
-                title="Error",
-                color=self.bot.error_color,
-                description="Invalid multi-step alias, try wrapping each steps in quotes.",
-            )
-            embed.set_footer(text=f'See "{self.bot.prefix}alias add" for more details.')
-            return await ctx.send(embed=embed)
-
-        if len(values) == 1:
-            linked_command, *messages = values[0].split(maxsplit=1)
-            if not self.bot.get_command(linked_command):
-                alias_command = self.bot.aliases.get(linked_command)
-                if alias_command is not None:
-                    if messages:
-                        values = [f"{alias_command} {messages[0]}"]
-                    else:
-                        values = [alias_command]
-                else:
-                    embed = discord.Embed(
-                        title="Error",
-                        color=self.bot.error_color,
-                        description="The command you are attempting to point "
-                        f"to does not exist: `{linked_command}`.",
-                    )
-                    return await ctx.send(embed=embed)
-            embed = discord.Embed(
-                title="Edited alias",
-                color=self.bot.main_color,
-                description=f'`{name}` now points to: "{values[0]}".',
-            )
-
-        else:
-            embed = discord.Embed(
-                title="Edited alias",
-                color=self.bot.main_color,
-                description=f"`{name}` now points to the following steps:",
-            )
-
-            for i, val in enumerate(values, start=1):
-                linked_command, *messages = val.split(maxsplit=1)
-                if not self.bot.get_command(linked_command):
-                    alias_command = self.bot.aliases.get(linked_command)
-                    if alias_command is not None:
-                        if messages:
-                            values = [f"{alias_command} {messages[0]}"]
-                        else:
-                            values = [alias_command]
-                    else:
-                        embed = discord.Embed(
-                            title="Error",
-                            color=self.bot.error_color,
-                            description="The command you are attempting to point "
-                            f"to on step {i} does not exist: `{linked_command}`.",
-                        )
-                        return await ctx.send(embed=embed)
-                embed.description += f"\n{i}: {val}"
-
-        self.bot.aliases[name] = "&&".join(values)
-        await self.bot.config.update()
+        embed = await self.make_alias(name, value, "Edited")
         return await ctx.send(embed=embed)
 
     @commands.group(aliases=["perms"], invoke_without_command=True)
@@ -1256,9 +1202,7 @@ class Utility(commands.Cog):
 
     @permissions.command(name="override")
     @checks.has_permissions(PermissionLevel.OWNER)
-    async def permissions_override(
-        self, ctx, command_name: str.lower, *, level_name: str
-    ):
+    async def permissions_override(self, ctx, command_name: str.lower, *, level_name: str):
         """
         Change a permission level for a specific command.
 
@@ -1297,9 +1241,7 @@ class Utility(commands.Cog):
                 command.qualified_name,
                 level.name,
             )
-            self.bot.config["override_command_level"][
-                command.qualified_name
-            ] = level.name
+            self.bot.config["override_command_level"][command.qualified_name] = level.name
 
             await self.bot.config.update()
             embed = discord.Embed(
@@ -1332,7 +1274,7 @@ class Utility(commands.Cog):
         - `{prefix}perms add command "plugin enabled" @role`
         - `{prefix}perms add command help 984301093849028`
 
-        Do not ping `@everyone` for granting permission to everyone, use "everyone" or "all" instead,
+        Do not ping `@everyone` for granting permission to everyone, use "everyone" or "all" instead.
         """
 
         if type_ not in {"command", "level"}:
@@ -1371,9 +1313,7 @@ class Utility(commands.Cog):
                     key = self.bot.modmail_guild.get_member(value)
                 if key is not None:
                     logger.info("Granting %s access to Modmail category.", key.name)
-                    await self.bot.main_category.set_permissions(
-                        key, read_messages=True
-                    )
+                    await self.bot.main_category.set_permissions(key, read_messages=True)
 
         embed = discord.Embed(
             title="Success",
@@ -1410,7 +1350,7 @@ class Utility(commands.Cog):
         - `{prefix}perms remove override block`
         - `{prefix}perms remove override "snippet add"`
 
-        Do not ping `@everyone` for granting permission to everyone, use "everyone" or "all" instead,
+        Do not ping `@everyone` for granting permission to everyone, use "everyone" or "all" instead.
         """
         if type_ not in {"command", "level", "override"} or (
             type_ != "override" and user_or_role is None
@@ -1470,21 +1410,13 @@ class Utility(commands.Cog):
                         self.bot.modmail_guild.default_role, read_messages=False
                     )
                 elif isinstance(user_or_role, discord.Role):
-                    logger.info(
-                        "Denying %s access to Modmail category.", user_or_role.name
-                    )
-                    await self.bot.main_category.set_permissions(
-                        user_or_role, overwrite=None
-                    )
+                    logger.info("Denying %s access to Modmail category.", user_or_role.name)
+                    await self.bot.main_category.set_permissions(user_or_role, overwrite=None)
                 else:
                     member = self.bot.modmail_guild.get_member(value)
                     if member is not None and member != self.bot.modmail_guild.me:
-                        logger.info(
-                            "Denying %s access to Modmail category.", member.name
-                        )
-                        await self.bot.main_category.set_permissions(
-                            member, overwrite=None
-                        )
+                        logger.info("Denying %s access to Modmail category.", member.name)
+                        await self.bot.main_category.set_permissions(member, overwrite=None)
 
         embed = discord.Embed(
             title="Success",
@@ -1534,11 +1466,7 @@ class Utility(commands.Cog):
     @permissions.command(name="get", usage="[@user] or [command/level/override] [name]")
     @checks.has_permissions(PermissionLevel.OWNER)
     async def permissions_get(
-        self,
-        ctx,
-        user_or_role: Union[discord.Role, utils.User, str],
-        *,
-        name: str = None,
+        self, ctx, user_or_role: Union[discord.Role, utils.User, str], *, name: str = None
     ):
         """
         View the currently-set permissions.
@@ -1564,33 +1492,31 @@ class Utility(commands.Cog):
         - `{prefix}perms get override block`
         - `{prefix}perms get override permissions add`
 
-        Do not ping `@everyone` for granting permission to everyone, use "everyone" or "all" instead,
+        Do not ping `@everyone` for granting permission to everyone, use "everyone" or "all" instead.
         """
 
         if name is None and user_or_role not in {"command", "level", "override"}:
-            value = self._verify_user_or_role(user_or_role)
+            value = str(self._verify_user_or_role(user_or_role))
 
             cmds = []
             levels = []
 
             done = set()
+            command_permissions = self.bot.config["command_permissions"]
+            level_permissions = self.bot.config["level_permissions"]
             for command in self.bot.walk_commands():
                 if command not in done:
                     done.add(command)
-                    permissions = self.bot.config["command_permissions"].get(
-                        command.qualified_name, []
-                    )
+                    permissions = command_permissions.get(command.qualified_name, [])
                     if value in permissions:
                         cmds.append(command.qualified_name)
 
             for level in PermissionLevel:
-                permissions = self.bot.config["level_permissions"].get(level.name, [])
+                permissions = level_permissions.get(level.name, [])
                 if value in permissions:
                     levels.append(level.name)
 
-            mention = getattr(
-                user_or_role, "name", getattr(user_or_role, "id", user_or_role)
-            )
+            mention = getattr(user_or_role, "name", getattr(user_or_role, "id", user_or_role))
             desc_cmd = (
                 ", ".join(map(lambda x: f"`{x}`", cmds))
                 if cmds
@@ -1640,14 +1566,10 @@ class Utility(commands.Cog):
                             )
                         )
                     else:
-                        for items in zip_longest(
-                            *(iter(sorted(overrides.items())),) * 15
-                        ):
+                        for items in zip_longest(*(iter(sorted(overrides.items())),) * 15):
                             description = "\n".join(
                                 ": ".join((f"`{name}`", level))
-                                for name, level in takewhile(
-                                    lambda x: x is not None, items
-                                )
+                                for name, level in takewhile(lambda x: x is not None, items)
                             )
                             embed = discord.Embed(
                                 color=self.bot.main_color, description=description
@@ -1703,9 +1625,7 @@ class Utility(commands.Cog):
                     return await ctx.send(embed=embed)
 
                 if user_or_role == "command":
-                    embeds.append(
-                        self._get_perm(ctx, command.qualified_name, "command")
-                    )
+                    embeds.append(self._get_perm(ctx, command.qualified_name, "command"))
                 else:
                     embeds.append(self._get_perm(ctx, level.name, "level"))
             else:
@@ -1714,9 +1634,7 @@ class Utility(commands.Cog):
                     for command in self.bot.walk_commands():
                         if command not in done:
                             done.add(command)
-                            embeds.append(
-                                self._get_perm(ctx, command.qualified_name, "command")
-                            )
+                            embeds.append(self._get_perm(ctx, command.qualified_name, "command"))
                 else:
                     for perm_level in PermissionLevel:
                         embeds.append(self._get_perm(ctx, perm_level.name, "level"))
@@ -1758,12 +1676,10 @@ class Utility(commands.Cog):
         embed.title = "Success"
 
         if not hasattr(target, "mention"):
-            target = self.bot.get_user(target.id) or self.bot.modmail_guild.get_role(
-                target.id
-            )
+            target = self.bot.get_user(target.id) or self.bot.modmail_guild.get_role(target.id)
 
         embed.description = (
-            f"{'Un-w' if removed else 'W'}hitelisted " f"{target.mention} to view logs."
+            f"{'Un-w' if removed else 'W'}hitelisted {target.mention} to view logs."
         )
 
         await ctx.send(embed=embed)
@@ -1788,14 +1704,265 @@ class Utility(commands.Cog):
         embed = discord.Embed(color=self.bot.main_color)
         embed.title = "Oauth Whitelist"
 
-        embed.add_field(
-            name="Users", value=" ".join(u.mention for u in users) or "None"
-        )
-        embed.add_field(
-            name="Roles", value=" ".join(r.mention for r in roles) or "None"
-        )
+        embed.add_field(name="Users", value=" ".join(u.mention for u in users) or "None")
+        embed.add_field(name="Roles", value=" ".join(r.mention for r in roles) or "None")
 
         await ctx.send(embed=embed)
+
+    @commands.group(invoke_without_command=True)
+    @checks.has_permissions(PermissionLevel.OWNER)
+    async def autotrigger(self, ctx):
+        """Automatically trigger alias-like commands based on a certain keyword in the user's inital message"""
+        await ctx.send_help(ctx.command)
+
+    @autotrigger.command(name="add")
+    @checks.has_permissions(PermissionLevel.OWNER)
+    async def autotrigger_add(self, ctx, keyword, *, command):
+        """Adds a trigger to automatically trigger an alias-like command"""
+        if keyword in self.bot.auto_triggers:
+            embed = discord.Embed(
+                title="Error",
+                color=self.bot.error_color,
+                description=f"Another autotrigger with the same name already exists: `{keyword}`.",
+            )
+        else:
+            self.bot.auto_triggers[keyword] = command
+            await self.bot.config.update()
+
+            embed = discord.Embed(
+                title="Success",
+                color=self.bot.main_color,
+                description=f"Keyword `{keyword}` has been linked to `{command}`.",
+            )
+
+        await ctx.send(embed=embed)
+
+    @autotrigger.command(name="edit")
+    @checks.has_permissions(PermissionLevel.OWNER)
+    async def autotrigger_edit(self, ctx, keyword, *, command):
+        """Edits a pre-existing trigger to automatically trigger an alias-like command"""
+        if keyword not in self.bot.auto_triggers:
+            embed = utils.create_not_found_embed(
+                keyword, self.bot.auto_triggers.keys(), "Autotrigger"
+            )
+        else:
+            self.bot.auto_triggers[keyword] = command
+            await self.bot.config.update()
+
+            embed = discord.Embed(
+                title="Success",
+                color=self.bot.main_color,
+                description=f"Keyword `{keyword}` has been linked to `{command}`.",
+            )
+
+        await ctx.send(embed=embed)
+
+    @autotrigger.command(name="remove")
+    @checks.has_permissions(PermissionLevel.OWNER)
+    async def autotrigger_remove(self, ctx, keyword):
+        """Removes a trigger to automatically trigger an alias-like command"""
+        try:
+            del self.bot.auto_triggers[keyword]
+        except KeyError:
+            embed = discord.Embed(
+                title="Error",
+                color=self.bot.error_color,
+                description=f"Keyword `{keyword}` could not be found.",
+            )
+            await ctx.send(embed=embed)
+        else:
+            await self.bot.config.update()
+
+            embed = discord.Embed(
+                title="Success",
+                color=self.bot.main_color,
+                description=f"Keyword `{keyword}` has been removed.",
+            )
+            await ctx.send(embed=embed)
+
+    @autotrigger.command(name="test")
+    @checks.has_permissions(PermissionLevel.OWNER)
+    async def autotrigger_test(self, ctx, *, text):
+        """Tests a string against the current autotrigger setup"""
+        for keyword in self.bot.auto_triggers:
+            if self.bot.config.get("use_regex_autotrigger"):
+                check = re.match(keyword, text)
+                regex = True
+            else:
+                check = keyword.lower() in text.lower()
+                regex = False
+
+            if check:
+                alias = self.bot.auto_triggers[keyword]
+                embed = discord.Embed(
+                    title=f"{'Regex ' if regex else ''}Keyword Found",
+                    color=self.bot.main_color,
+                    description=f"autotrigger keyword `{keyword}` found. Command executed: `{alias}`",
+                )
+                return await ctx.send(embed=embed)
+
+        embed = discord.Embed(
+            title="Keyword Not Found",
+            color=self.bot.error_color,
+            description=f"No autotrigger keyword found.",
+        )
+        return await ctx.send(embed=embed)
+
+    @autotrigger.command(name="list")
+    @checks.has_permissions(PermissionLevel.OWNER)
+    async def autotrigger_list(self, ctx):
+        """Lists all autotriggers set up"""
+        embeds = []
+        for keyword in self.bot.auto_triggers:
+            command = self.bot.auto_triggers[keyword]
+            embed = discord.Embed(title=keyword, color=self.bot.main_color, description=command,)
+            embeds.append(embed)
+
+        if not embeds:
+            embeds.append(
+                discord.Embed(
+                    title="No autotrigger set",
+                    color=self.bot.error_color,
+                    description=f"Use `{self.bot.prefix}autotrigger add` to add new autotriggers.",
+                )
+            )
+
+        await EmbedPaginatorSession(ctx, *embeds).run()
+
+    @commands.command()
+    @checks.has_permissions(PermissionLevel.OWNER)
+    @checks.github_token_required()
+    @trigger_typing
+    async def github(self, ctx):
+        """Shows the GitHub user your Github_Token is linked to."""
+        data = await self.bot.api.get_user_info()
+
+        if data:
+            embed = discord.Embed(
+                title="GitHub", description="Current User", color=self.bot.main_color
+            )
+            user = data["user"]
+            embed.set_author(name=user["username"], icon_url=user["avatar_url"], url=user["url"])
+            embed.set_thumbnail(url=user["avatar_url"])
+            await ctx.send(embed=embed)
+        else:
+            await ctx.send(
+                embed=discord.Embed(title="Invalid Github Token", color=self.bot.error_color)
+            )
+
+    @commands.command()
+    @checks.has_permissions(PermissionLevel.OWNER)
+    @checks.github_token_required(ignore_if_not_heroku=True)
+    @trigger_typing
+    async def update(self, ctx, *, flag: str = ""):
+        """
+        Update Modmail.
+        To stay up-to-date with the latest commit rom GitHub, specify "force" as the flag.
+        """
+
+        changelog = await Changelog.from_url(self.bot)
+        latest = changelog.latest_version
+
+        desc = (
+            f"The latest version is [`{self.bot.version}`]"
+            "(https://github.com/kyb3r/modmail/blob/master/bot.py#L25)"
+        )
+
+        if self.bot.version >= parse_version(latest.version) and flag.lower() != "force":
+            embed = discord.Embed(
+                title="Already up to date", description=desc, color=self.bot.main_color
+            )
+
+            data = await self.bot.api.get_user_info()
+            if data:
+                user = data["user"]
+                embed.set_author(
+                    name=user["username"], icon_url=user["avatar_url"], url=user["url"]
+                )
+            await ctx.send(embed=embed)
+        else:
+            if self.bot.hosting_method == HostingMethod.HEROKU:
+                data = await self.bot.api.update_repository()
+
+                commit_data = data["data"]
+                user = data["user"]
+
+                if commit_data and commit_data.get("html_url"):
+                    embed = discord.Embed(color=self.bot.main_color)
+
+                    embed.set_footer(
+                        text=f"Updating Modmail v{self.bot.version} " f"-> v{latest.version}"
+                    )
+
+                    embed.set_author(
+                        name=user["username"] + " - Updating bot",
+                        icon_url=user["avatar_url"],
+                        url=user["url"],
+                    )
+
+                    embed.description = latest.description
+                    for name, value in latest.fields.items():
+                        embed.add_field(name=name, value=truncate(value, 200))
+
+                    html_url = commit_data["html_url"]
+                    short_sha = commit_data["sha"][:6]
+                    embed.add_field(name="Merge Commit", value=f"[`{short_sha}`]({html_url})")
+                else:
+                    embed = discord.Embed(
+                        title="Already up to date",
+                        description="No further updates required",
+                        color=self.bot.main_color,
+                    )
+                    embed.set_footer(text="Force update")
+                    embed.set_author(
+                        name=user["username"], icon_url=user["avatar_url"], url=user["url"]
+                    )
+                await ctx.send(embed=embed)
+            else:
+                # update fork if gh_token exists
+                try:
+                    await self.bot.api.update_repository()
+                except InvalidConfigError:
+                    pass
+
+                command = "git pull"
+
+                proc = await asyncio.create_subprocess_shell(command, stderr=PIPE, stdout=PIPE,)
+                err = await proc.stderr.read()
+                err = err.decode("utf-8").rstrip()
+                res = await proc.stdout.read()
+                res = res.decode("utf-8").rstrip()
+
+                if err and not res:
+                    embed = discord.Embed(
+                        title="Update failed", description=err, color=self.bot.error_color
+                    )
+                    await ctx.send(embed=embed)
+
+                elif res != "Already up to date.":
+                    logger.info("Bot has been updated.")
+
+                    embed = discord.Embed(title="Bot has been updated", color=self.bot.main_color,)
+                    embed.set_footer(
+                        text=f"Updating Modmail v{self.bot.version} " f"-> v{latest.version}"
+                    )
+                    embed.description = latest.description
+                    for name, value in latest.fields.items():
+                        embed.add_field(name=name, value=truncate(value, 200))
+
+                    if self.bot.hosting_method == HostingMethod.OTHER:
+                        embed.description = (
+                            "If you do not have an auto-restart setup, please manually start the bot.",
+                        )
+
+                    await ctx.send(embed=embed)
+                    await self.bot.logout()
+                else:
+                    embed = discord.Embed(
+                        title="Already up to date", description=desc, color=self.bot.main_color,
+                    )
+                    embed.set_footer(text="Force update")
+                    await ctx.send(embed=embed)
 
     @commands.command(hidden=True, name="eval")
     @checks.has_permissions(PermissionLevel.OWNER)
@@ -1840,7 +2007,7 @@ class Utility(commands.Cog):
             exec(to_compile, env)  # pylint: disable=exec-used
         except Exception as exc:
             await ctx.send(f"```py\n{exc.__class__.__name__}: {exc}\n```")
-            return await ctx.message.add_reaction("\u2049")
+            return await self.bot.add_reaction(ctx.message, "\u2049")
 
         func = env["func"]
         try:
@@ -1849,7 +2016,7 @@ class Utility(commands.Cog):
         except Exception:
             value = stdout.getvalue()
             await ctx.send(f"```py\n{value}{traceback.format_exc()}\n```")
-            return await ctx.message.add_reaction("\u2049")
+            return await self.bot.add_reaction(ctx.message, "\u2049")
 
         else:
             value = stdout.getvalue()
@@ -1874,6 +2041,8 @@ class Utility(commands.Cog):
                             await ctx.send(f"```py\n{page}\n```")
                             break
                         await ctx.send(f"```py\n{page}\n```")
+
+        await self.bot.add_reaction(ctx.message, "\u2705")
 
 
 def setup(bot):
